@@ -1,0 +1,1284 @@
+-- Robust remote loader with fallback to prevent hard crash when HTTP fails
+local splib = nil
+local usedFallback = false
+do
+  local ok, err = pcall(function()
+    local body = nil
+    if game and game.HttpGet then
+      body = game:HttpGet("https://raw.githubusercontent.com/as6cd0/SP_Hub/main/splibv2")
+    end
+    assert(body and type(body) == "string", "HTTP fetch failed for splib")
+    local func = assert(loadstring(body), "Failed to load splib code")
+    splib = func()
+  end)
+  if not ok or type(splib) ~= "table" or not splib.MakeWindow then
+    usedFallback = true
+    warn("[arsenal.lua] failed to load remote splib, using fallback stub:", err)
+    splib = {
+      MakeWindow = function(...) return {
+        MakeTab = function(...) return {
+          AddSection = function(...) end,
+          AddToggle = function(...) end,
+          AddDropdown = function(...) end,
+          AddSlider = function(...) end,
+          AddColorPicker = function(...) end,
+          AddParagraph = function(...) end,
+          ClearSettings = function(...) end,
+          SetFlag = function(...) end,
+          MakeNotification = function(...) end
+        } end
+      } end
+    }
+  end
+end
+
+print("arsenal.lua: splib loaded, fallback=", tostring(usedFallback))
+
+local Window = nil
+do
+  local ok, w = pcall(function()
+    return splib:MakeWindow({
+      Name = "SP Library v2",
+      SubTitle = "by SuperCosmos and CR33P",
+      Setting = false,
+      Intro = true,
+      IntroText = "XCP Hub Loading",
+      IntroIcon = "null",
+      IntroSpeed = 1,
+      Toggle = false,
+      IsPremium = false,
+      Icon = "rbxassetid://83114982417764",
+      RainbowMainFrame = false,
+      RainbowTitle = false,
+      RainbowSubTitle = false,
+      ToggleIcon = "rbxassetid://83114982417764",
+      CloseCallback = true
+    })
+  end)
+  if ok and w then
+    Window = w
+  else
+    -- best-effort fallback: call MakeWindow without args or provide a simple table
+    if type(splib.MakeWindow) == "function" then
+      pcall(function() Window = splib.MakeWindow() end)
+    end
+    Window = Window or { MakeTab = function(...) return { AddSection = function(...) end, AddToggle = function(...) end, AddDropdown = function(...) end, AddSlider = function(...) end, AddColorPicker = function(...) end, AddTextbox = function(...) end, AddParagraph = function(...) end, ClearSettings = function(...) end, SetFlag = function(...) end, MakeNotification = function(...) end } end }
+  end
+end
+
+-- Unified notifier: uses splib if available, otherwise falls back to print
+local function Notify(title, content, time)
+  time = time or 2
+  if splib and splib.MakeNotification then
+    pcall(function() splib:MakeNotification({Name = title, Content = content, Time = time}) end)
+  else
+    print(string.format("%s: %s", title, content))
+  end
+end
+
+-- Attempt to clear any persistent UI settings saved by splib (best-effort)
+local function tryClearSavedSettings()
+  pcall(function()
+    if Window and Window.ClearSettings then
+      Window:ClearSettings()
+    end
+  end)
+  pcall(function()
+    if splib and splib.ClearSettings then
+      splib:ClearSettings()
+    end
+  end)
+
+  -- Try resetting common flag names to defaults (best-effort)
+  local knownFlags = {
+    "AimBotToggle","AimBotTargetPart","AimWallCheck","SilentAimToggle","SilentAimTargetPart","SilentAimFOV",
+    "AimShowFOV","AimFOVSize","AimFOVThickness","AimFOVColor",
+    "ESPToggle","ESPShowNames","ESPTeammateCheck","ESPBoxColor",
+    "SkeletonESPToggle","SkeletonESPThickness","SkeletonESPColor",
+    "WalkspeedToggle","WalkspeedValue","JumpPowerToggle","JumpPowerValue"
+  }
+  for _, flag in ipairs(knownFlags) do
+    pcall(function()
+      if Window and Window.SetFlag then
+        Window:SetFlag(flag, false)
+      end
+    end)
+  end
+end
+
+-- Run reset on start so previous session flags don't persist
+tryClearSavedSettings()
+
+local Tab = Window:MakeTab({
+  IsMobile = false,
+  IsPC = false,
+  Name = "Combat",
+  Icon = "rbxassetid://4483345998"
+})
+
+Tab:AddSection("Combat")
+Tab:AddSection("Aimbot")
+
+-- Minimal Aimbot: toggle + right-click hold lock-to-head
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+local AimbotEnabled = false
+local AimbotHold = false
+local AimbotFOV = 120 -- pixels
+local AimbotTargetPart = "Head"
+local WallCheckEnabled = true
+local AimRaycastParams = RaycastParams.new()
+AimRaycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+AimRaycastParams.IgnoreWater = true
+
+local function getTargetPartForPlayer(player)
+  if not player or not player.Character then return nil end
+  if AimbotTargetPart == "Head" then
+    return player.Character:FindFirstChild("Head") or player.Character:FindFirstChild("UpperTorso") or player.Character:FindFirstChild("HumanoidRootPart")
+  elseif AimbotTargetPart == "Body" then
+    return player.Character:FindFirstChild("UpperTorso") or player.Character:FindFirstChild("LowerTorso") or player.Character:FindFirstChild("HumanoidRootPart")
+  elseif AimbotTargetPart == "Legs" then
+    return player.Character:FindFirstChild("LeftFoot") or player.Character:FindFirstChild("RightFoot") or player.Character:FindFirstChild("LowerTorso") or player.Character:FindFirstChild("HumanoidRootPart")
+  end
+  return player.Character:FindFirstChild("Head")
+end
+
+local function getClosestAimTarget()
+  local camera = workspace.CurrentCamera
+  if not camera then return nil end
+  local mousePos = UserInputService:GetMouseLocation()
+  local bestDist = AimbotFOV
+  local bestPart = nil
+
+  for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+      if not (LocalPlayer and LocalPlayer.Team and player.Team and player.Team == LocalPlayer.Team) then
+        local char = player.Character
+        if char then
+          local humanoid = char:FindFirstChildOfClass("Humanoid")
+          if humanoid and humanoid.Health > 0 then
+            local part = getTargetPartForPlayer(player)
+            if part and part:IsA("BasePart") then
+              local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
+              if onScreen and screenPos.Z > 0 then
+                -- Wall check: raycast from camera to target part unless wall check is disabled
+                local visible = true
+                if WallCheckEnabled then
+                  AimRaycastParams.FilterDescendantsInstances = {LocalPlayer and LocalPlayer.Character or {}}
+                  local origin = camera.CFrame.Position
+                  local direction = (part.Position - origin)
+                  local result = workspace:Raycast(origin, direction, AimRaycastParams)
+                  if result and result.Instance and not result.Instance:IsDescendantOf(part.Parent) then
+                    visible = false
+                  end
+                end
+
+                if visible then
+                  local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                  if dist < bestDist then
+                    bestDist = dist
+                    bestPart = part
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  return bestPart
+end
+
+-- Input bindings: support both UserInputService and legacy Mouse events
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+  if gameProcessed then return end
+  if input.UserInputType == Enum.UserInputType.MouseButton2 then
+    AimbotHold = true
+  end
+end)
+UserInputService.InputEnded:Connect(function(input, gameProcessed)
+  if gameProcessed then return end
+  if input.UserInputType == Enum.UserInputType.MouseButton2 then
+    AimbotHold = false
+  end
+end)
+
+if LocalPlayer then
+  local ok, mouse = pcall(function() return LocalPlayer:GetMouse() end)
+  if ok and mouse then
+    mouse.Button2Down:Connect(function() AimbotHold = true end)
+    mouse.Button2Up:Connect(function() AimbotHold = false end)
+  end
+end
+
+RunService.RenderStepped:Connect(function()
+  if not AimbotEnabled or not AimbotHold then return end
+  local targetPart = getClosestAimTarget()
+  local camera = workspace.CurrentCamera
+  if targetPart and camera then
+    camera.CFrame = CFrame.new(camera.CFrame.Position, targetPart.Position)
+  end
+end)
+
+Tab:AddToggle({
+  Name = "AimBot",
+  Desc = "Hold right-click to lock to nearest head while enabled",
+  Default = false,
+  Flag = "AimBotToggle",
+  Callback = function(Value)
+    AimbotEnabled = Value
+    Notify("Aimbot", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+Tab:AddDropdown({
+  Name = "Aim Target Part",
+  Desc = "Choose which body part to lock onto",
+  Default = "Head",
+  Options = {"Head", "Body", "Legs"},
+  Flag = "AimBotTargetPart",
+  Callback = function(Value)
+    AimbotTargetPart = Value
+  end
+})
+
+Tab:AddToggle({
+  Name = "Wall Check",
+  Desc = "Only lock if there is no wall between you and target",
+  Default = true,
+  Flag = "AimWallCheck",
+  Callback = function(Value)
+    WallCheckEnabled = Value
+    Notify("Wall Check", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+Tab:AddSection("Silent Aim")
+
+-- Silent Aim: redirects bullets to targets in FOV
+local SilentAimEnabled = false
+local SilentAimTargetPart = "Head"
+local SilentAimFOV = 120
+
+local function getSilentAimTarget()
+  local camera = workspace.CurrentCamera
+  if not camera then return nil end
+  local mousePos = UserInputService:GetMouseLocation()
+  local bestDist = SilentAimFOV
+  local bestPart = nil
+
+  for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+      if not (LocalPlayer and LocalPlayer.Team and player.Team and player.Team == LocalPlayer.Team) then
+        local char = player.Character
+        if char then
+          local humanoid = char:FindFirstChildOfClass("Humanoid")
+          if humanoid and humanoid.Health > 0 then
+            local part
+            if SilentAimTargetPart == "Head" then
+              part = char:FindFirstChild("Head") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("HumanoidRootPart")
+            elseif SilentAimTargetPart == "Body" then
+              part = char:FindFirstChild("UpperTorso") or char:FindFirstChild("LowerTorso") or char:FindFirstChild("HumanoidRootPart")
+            elseif SilentAimTargetPart == "Legs" then
+              part = char:FindFirstChild("LeftFoot") or char:FindFirstChild("RightFoot") or char:FindFirstChild("LowerTorso") or char:FindFirstChild("HumanoidRootPart")
+            else
+              part = char:FindFirstChild("Head")
+            end
+            
+            if part and part:IsA("BasePart") then
+              local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
+              if onScreen and screenPos.Z > 0 then
+                local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                if dist < bestDist then
+                  bestDist = dist
+                  bestPart = part
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  return bestPart
+end
+
+local SilentAimLastRedirect = 0
+local SilentAimRedirectInterval = 0.08
+local SilentAimMaxDistance = 300
+local BulletFolderNames = {"Bullets", "Projectiles", "Ammo", "Shells", "BulletFolder"}
+
+local function getBulletRoots()
+  local roots = {}
+  for _, name in ipairs(BulletFolderNames) do
+    local root = workspace:FindFirstChild(name)
+    if root and root:IsA("Instance") then
+      table.insert(roots, root)
+    end
+  end
+  return roots
+end
+
+local function getPartVelocity(part)
+  if not part or not part:IsA("BasePart") then
+    return nil
+  end
+
+  local velocity = part.Velocity
+  if velocity and velocity.Magnitude > 1 then
+    return velocity
+  end
+
+  local ok, assemblyVelocity = pcall(function()
+    return part.AssemblyLinearVelocity
+  end)
+  if ok and assemblyVelocity and assemblyVelocity.Magnitude > 1 then
+    return assemblyVelocity
+  end
+
+  return nil
+end
+
+local function isPotentialBullet(part)
+  if not part or not part:IsA("BasePart") then
+    return false
+  end
+  if LocalPlayer and LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then
+    return false
+  end
+  if part.Anchored then
+    return false
+  end
+
+  local velocity = getPartVelocity(part)
+  if not velocity or velocity.Magnitude < 8 then
+    return false
+  end
+
+  local sizeMag = part.Size.Magnitude
+  if sizeMag > 25 or sizeMag < 0.08 then
+    return false
+  end
+
+  local name = part.Name:lower()
+  if name:find("bullet") or name:find("projectile") or name:find("shot") or name:find("shell") or name:find("round") or name:find("ammo") or name:find("tracer") or name:find("spark") then
+    return true
+  end
+
+  local parentName = part.Parent and part.Parent.Name:lower() or ""
+  if parentName:find("bullet") or parentName:find("projectile") or parentName:find("ammo") or parentName:find("shell") or parentName:find("round") or parentName:find("tracer") then
+    return true
+  end
+
+  -- fallback: fast small parts can still be bullets
+  if velocity.Magnitude > 28 and sizeMag < 8 and part:GetMass() < 18 then
+    return true
+  end
+
+  return false
+end
+
+local function collectBulletCandidates()
+  local candidates = {}
+  local roots = getBulletRoots()
+  local sources = {}
+
+  if #roots > 0 then
+    for _, root in ipairs(roots) do
+      table.insert(sources, root)
+    end
+  else
+    table.insert(sources, workspace)
+  end
+
+  for _, source in ipairs(sources) do
+    for _, obj in ipairs(source:GetDescendants()) do
+      if isPotentialBullet(obj) then
+        table.insert(candidates, obj)
+        if #candidates >= 20 then
+          return candidates
+        end
+      end
+    end
+  end
+
+  return candidates
+end
+
+local function redirectBulletToTarget(obj, targetPart)
+  if not obj or not obj:IsA("BasePart") or not targetPart or not targetPart:IsA("BasePart") then
+    return
+  end
+
+  local direction = targetPart.Position - obj.Position
+  if direction.Magnitude <= 0 then
+    return
+  end
+  direction = direction.Unit
+
+  local speed = math.max(120, obj.Velocity.Magnitude)
+  local velocity = direction * speed
+
+  pcall(function()
+    local bodyVel = obj:FindFirstChildOfClass("BodyVelocity")
+    if bodyVel then
+      bodyVel.Velocity = velocity
+      return
+    end
+
+    local linearVel = obj:FindFirstChildOfClass("LinearVelocity")
+    if linearVel then
+      linearVel.Velocity = velocity
+      return
+    end
+
+    if pcall(function() obj.AssemblyLinearVelocity = velocity end) then
+      return
+    end
+
+    obj.Velocity = velocity
+  end)
+
+  pcall(function()
+    obj.CFrame = CFrame.new(obj.Position, obj.Position + direction)
+  end)
+end
+
+-- Bullet redirection logic
+RunService.Heartbeat:Connect(function()
+  if not SilentAimEnabled then return end
+  if tick() - SilentAimLastRedirect < SilentAimRedirectInterval then
+    return
+  end
+  SilentAimLastRedirect = tick()
+
+  local targetPart = getSilentAimTarget()
+  if not targetPart then return end
+
+  local camera = workspace.CurrentCamera
+  if not camera then return end
+
+  local bullets = collectBulletCandidates()
+  for _, obj in ipairs(bullets) do
+    if obj and obj.Parent and obj:IsA("BasePart") then
+      local dist = (obj.Position - camera.CFrame.Position).Magnitude
+      if dist < SilentAimMaxDistance then
+        redirectBulletToTarget(obj, targetPart)
+      end
+    end
+  end
+end)
+
+Tab:AddToggle({
+  Name = "Silent Aim",
+  Desc = "Redirects bullets to closest target in FOV",
+  Default = false,
+  Flag = "SilentAimToggle",
+  Callback = function(Value)
+    if Value then
+      SilentAimEnabled = false
+      Notify("Silent Aim", "Cannot be turned on; we are still working on this feature.", 5)
+    else
+      SilentAimEnabled = false
+      Notify("Silent Aim", "Disabled", 2)
+    end
+  end
+})
+
+Tab:AddDropdown({
+  Name = "Silent Aim Target Part",
+  Desc = "Choose which body part to redirect bullets to",
+  Default = "Head",
+  Options = {"Head", "Body", "Legs"},
+  Flag = "SilentAimTargetPart",
+  Callback = function(Value)
+    SilentAimTargetPart = Value
+  end
+})
+
+Tab:AddSlider({
+  Name = "Silent Aim FOV",
+  Desc = "FOV radius for silent aim targeting",
+  Min = 20,
+  Max = 800,
+  Default = SilentAimFOV,
+  Precise = false,
+  Flag = "SilentAimFOV",
+  Callback = function(Value)
+    SilentAimFOV = Value
+  end
+})
+
+-- Aimbot FOV circle drawing and controls
+local AimbotShowFOV = false
+local AimbotThickness = 2
+local AimbotCircleColor = Color3.fromRGB(255, 50, 50)
+local AimbotCircle = nil
+
+local WalkspeedEnabled = false
+local WalkspeedValue = 16
+local WalkspeedDefault = 16
+local JumpPowerEnabled = false
+local JumpPowerValue = 50
+local JumpPowerDefault = 50
+
+local ESPEnabled = false
+local ESPShowNames = false
+local ESPTeammateCheck = false
+local ESPBoxColor = Color3.fromRGB(0, 255, 0)
+local ESPMaxDistance = 1000
+local ESPObjects = {}
+
+local SkeletonESPEnabled = false
+local SkeletonESPThickness = 2
+local SkeletonESPColor = Color3.fromRGB(255, 50, 50)
+local SkeletonESPObjects = {}
+
+local function getCharacterESPPoints(character)
+  if not character then
+    return nil
+  end
+
+  local head = character:FindFirstChild("Head")
+  local lowerTorso = character:FindFirstChild("LowerTorso") or character:FindFirstChild("HumanoidRootPart")
+  if not head or not lowerTorso then
+    return nil
+  end
+
+  local bottom = lowerTorso.Position - Vector3.new(0, lowerTorso.Size.Y / 2, 0)
+  return head.Position, bottom
+end
+
+local function ensureESPObjects(player)
+  if ESPObjects[player] then
+    return ESPObjects[player]
+  end
+
+  local box = Drawing.new("Square")
+  box.Thickness = 2
+  box.Transparency = 1
+  box.Filled = false
+  box.Visible = false
+
+  local label = Drawing.new("Text")
+  label.Size = 16
+  label.Color = ESPBoxColor
+  label.Center = true
+  label.Outline = true
+  label.OutlineColor = Color3.new(0, 0, 0)
+  label.Visible = false
+
+  ESPObjects[player] = {Box = box, Label = label}
+  return ESPObjects[player]
+end
+
+local function removeESPObjects(player)
+  local data = ESPObjects[player]
+  if data then
+    if data.Box then
+      data.Box:Remove()
+    end
+    if data.Label then
+      data.Label:Remove()
+    end
+    ESPObjects[player] = nil
+  end
+end
+
+local function updateESPForPlayer(player)
+  if not ESPEnabled then
+    removeESPObjects(player)
+    return
+  end
+
+  if ESPTeammateCheck and LocalPlayer and LocalPlayer.Team and player.Team and LocalPlayer.Team == player.Team then
+    removeESPObjects(player)
+    return
+  end
+
+  local character = player.Character
+  if not character or not character.Parent then
+    removeESPObjects(player)
+    return
+  end
+
+  local headPos, footPos = getCharacterESPPoints(character)
+  if not headPos or not footPos then
+    removeESPObjects(player)
+    return
+  end
+
+  local camera = workspace.CurrentCamera
+  if not camera then
+    return
+  end
+
+  local screenHead, headOnScreen = camera:WorldToViewportPoint(headPos)
+  local screenFoot, footOnScreen = camera:WorldToViewportPoint(footPos)
+  if not headOnScreen or not footOnScreen or screenHead.Z <= 0 or screenFoot.Z <= 0 then
+    local data = ESPObjects[player]
+    if data then
+      data.Box.Visible = false
+      data.Label.Visible = false
+    end
+    return
+  end
+
+  local topY = screenHead.Y
+  local bottomY = screenFoot.Y
+  local height = math.abs(bottomY - topY)
+  local width = math.max(18, height * 0.4)
+  local centerX = screenHead.X
+  local centerY = topY + height / 2
+
+  local distance = (camera.CFrame.Position - headPos).Magnitude
+  if distance > ESPMaxDistance then
+    removeESPObjects(player)
+    return
+  end
+
+  local displayDistance = math.floor(distance)
+  local text = player.Name
+  if ESPShowNames then
+    text = string.format("%s | %d studs", player.Name, displayDistance)
+  else
+    text = string.format("%d studs", displayDistance)
+  end
+
+  local data = ensureESPObjects(player)
+  data.Box.Size = Vector2.new(width, height)
+  data.Box.Position = Vector2.new(centerX - width / 2, topY)
+  data.Box.Color = ESPBoxColor
+  data.Box.Visible = true
+
+  data.Label.Position = Vector2.new(centerX, topY - 18)
+  data.Label.Color = ESPBoxColor
+  data.Label.Text = text
+  data.Label.Visible = true
+end
+
+local function getSkeletonPart(character, partName)
+  local part = character:FindFirstChild(partName)
+  if part then
+    return part
+  end
+
+  local alternateNames = {
+    UpperTorso = {"Torso"},
+    LowerTorso = {"Torso", "HumanoidRootPart"},
+    LeftUpperArm = {"Left Arm"},
+    RightUpperArm = {"Right Arm"},
+    LeftLowerArm = {"Left Arm"},
+    RightLowerArm = {"Right Arm"},
+    LeftUpperLeg = {"Left Leg"},
+    RightUpperLeg = {"Right Leg"},
+    LeftLowerLeg = {"Left Leg"},
+    RightLowerLeg = {"Right Leg"}
+  }
+
+  local alternates = alternateNames[partName]
+  if alternates then
+    for _, name in ipairs(alternates) do
+      local alt = character:FindFirstChild(name)
+      if alt then
+        return alt
+      end
+    end
+  end
+
+  return nil
+end
+
+local function getLocalHumanoid()
+  if not LocalPlayer then
+    return nil
+  end
+  local character = LocalPlayer.Character
+  if not character or not character.Parent then
+    return nil
+  end
+  return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function applyWalkspeed(value)
+  local humanoid = getLocalHumanoid()
+  if humanoid and humanoid:IsA("Humanoid") then
+    humanoid.WalkSpeed = value
+    return
+  end
+
+  if LocalPlayer then
+    local conn
+    conn = LocalPlayer.CharacterAdded:Connect(function(character)
+      local h = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+      if h and h:IsA("Humanoid") then
+        h.WalkSpeed = value
+      end
+      if conn then conn:Disconnect() end
+    end)
+  end
+end
+
+local function applyJumpPower(value)
+  local humanoid = getLocalHumanoid()
+  if humanoid and humanoid:IsA("Humanoid") then
+    pcall(function()
+      humanoid.UseJumpPower = true
+      humanoid.JumpPower = value
+    end)
+    return
+  end
+
+  if LocalPlayer then
+    local conn
+    conn = LocalPlayer.CharacterAdded:Connect(function(character)
+      local h = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+      if h and h:IsA("Humanoid") then
+        pcall(function()
+          h.UseJumpPower = true
+          h.JumpPower = value
+        end)
+      end
+      if conn then conn:Disconnect() end
+    end)
+  end
+end
+
+local function updateWalkspeed()
+  if WalkspeedEnabled then
+    applyWalkspeed(WalkspeedValue)
+  else
+    applyWalkspeed(WalkspeedDefault)
+  end
+end
+
+local function updateJumpPower()
+  if JumpPowerEnabled then
+    applyJumpPower(JumpPowerValue)
+  else
+    applyJumpPower(JumpPowerDefault)
+  end
+end
+
+local function refreshPlayerDefaults()
+  local humanoid = getLocalHumanoid()
+  if humanoid then
+    WalkspeedDefault = humanoid.WalkSpeed
+    JumpPowerDefault = humanoid.JumpPower
+  end
+end
+
+if LocalPlayer then
+  LocalPlayer.CharacterAdded:Connect(function(character)
+    character:WaitForChild("Humanoid", 5)
+    task.wait(0.1)
+    refreshPlayerDefaults()
+    updateWalkspeed()
+    updateJumpPower()
+  end)
+end
+
+if LocalPlayer and LocalPlayer.Character and LocalPlayer.Character.Parent then
+  task.defer(function()
+    task.wait(0.1)
+    refreshPlayerDefaults()
+    updateWalkspeed()
+    updateJumpPower()
+  end)
+end
+
+local function ensureSkeletonObjects(player)
+  if SkeletonESPObjects[player] then
+    return SkeletonESPObjects[player]
+  end
+
+  local lineCount = 10
+  local lines = {}
+  for i = 1, lineCount do
+    local line = Drawing.new("Line")
+    line.Thickness = SkeletonESPThickness
+    line.Transparency = 1
+    line.Color = SkeletonESPColor
+    line.Visible = false
+    table.insert(lines, line)
+  end
+
+  SkeletonESPObjects[player] = {Lines = lines}
+  return SkeletonESPObjects[player]
+end
+
+local function removeSkeletonObjects(player)
+  local data = SkeletonESPObjects[player]
+  if data then
+    for _, line in ipairs(data.Lines) do
+      if line then
+        line:Remove()
+      end
+    end
+    SkeletonESPObjects[player] = nil
+  end
+end
+
+local function updateSkeletonForPlayer(player)
+  if not SkeletonESPEnabled then
+    removeSkeletonObjects(player)
+    return
+  end
+
+  if ESPTeammateCheck and LocalPlayer and LocalPlayer.Team and player.Team and LocalPlayer.Team == player.Team then
+    removeSkeletonObjects(player)
+    return
+  end
+
+  local character = player.Character
+  if not character or not character.Parent then
+    removeSkeletonObjects(player)
+    return
+  end
+
+  local camera = workspace.CurrentCamera
+  if not camera then
+    return
+  end
+
+  local head = getSkeletonPart(character, "Head")
+  local upperTorso = getSkeletonPart(character, "UpperTorso")
+  local lowerTorso = getSkeletonPart(character, "LowerTorso")
+  local leftUpperArm = getSkeletonPart(character, "LeftUpperArm")
+  local rightUpperArm = getSkeletonPart(character, "RightUpperArm")
+  local leftLowerArm = getSkeletonPart(character, "LeftLowerArm")
+  local rightLowerArm = getSkeletonPart(character, "RightLowerArm")
+  local leftUpperLeg = getSkeletonPart(character, "LeftUpperLeg")
+  local rightUpperLeg = getSkeletonPart(character, "RightUpperLeg")
+  local leftLowerLeg = getSkeletonPart(character, "LeftLowerLeg")
+  local rightLowerLeg = getSkeletonPart(character, "RightLowerLeg")
+
+  local points = {
+    {head, upperTorso},
+    {upperTorso, lowerTorso},
+    {upperTorso, leftUpperArm},
+    {upperTorso, rightUpperArm},
+    {leftUpperArm, leftLowerArm},
+    {rightUpperArm, rightLowerArm},
+    {lowerTorso, leftUpperLeg},
+    {lowerTorso, rightUpperLeg},
+    {leftUpperLeg, leftLowerLeg},
+    {rightUpperLeg, rightLowerLeg}
+  }
+
+  local data = ensureSkeletonObjects(player)
+  for index, pair in ipairs(points) do
+    local line = data.Lines[index]
+    local partA, partB = pair[1], pair[2]
+    if line and partA and partB and partA:IsA("BasePart") and partB:IsA("BasePart") then
+      local screenA, onScreenA = camera:WorldToViewportPoint(partA.Position)
+      local screenB, onScreenB = camera:WorldToViewportPoint(partB.Position)
+      if onScreenA and onScreenB and screenA.Z > 0 and screenB.Z > 0 then
+        line.From = Vector2.new(screenA.X, screenA.Y)
+        line.To = Vector2.new(screenB.X, screenB.Y)
+        line.Color = SkeletonESPColor
+        line.Thickness = SkeletonESPThickness
+        line.Visible = true
+      else
+        line.Visible = false
+      end
+    elseif line then
+      line.Visible = false
+    end
+  end
+end
+
+local function updateAllESP()
+  if not Drawing or not Drawing.new then
+    return
+  end
+
+  for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+      updateESPForPlayer(player)
+      updateSkeletonForPlayer(player)
+    end
+  end
+end
+
+local function createAimbotCircle()
+  if not Drawing or not Drawing.new then
+    return
+  end
+  if AimbotCircle then return end
+  local ok, circle = pcall(function() return Drawing.new("Circle") end)
+  if not ok or not circle then
+    AimbotCircle = nil
+    return
+  end
+  AimbotCircle = circle
+  AimbotCircle.Thickness = AimbotThickness
+  AimbotCircle.Radius = AimbotFOV
+  AimbotCircle.Color = AimbotCircleColor
+  AimbotCircle.Transparency = 1
+  AimbotCircle.Filled = false
+  AimbotCircle.Visible = false
+end
+
+-- Update circle each frame (centered on cursor)
+RunService.RenderStepped:Connect(function()
+  createAimbotCircle()
+  if AimbotCircle then
+    local mousePos = UserInputService:GetMouseLocation()
+    AimbotCircle.Position = mousePos
+    if AimbotEnabled and SilentAimEnabled then
+      AimbotCircle.Radius = math.max(AimbotFOV, SilentAimFOV)
+    elseif AimbotEnabled then
+      AimbotCircle.Radius = AimbotFOV
+    elseif SilentAimEnabled then
+      AimbotCircle.Radius = SilentAimFOV
+    end
+    AimbotCircle.Thickness = AimbotThickness
+    AimbotCircle.Color = AimbotCircleColor
+    AimbotCircle.Visible = AimbotShowFOV and (AimbotEnabled or SilentAimEnabled)
+  end
+  updateAllESP()
+  -- enforce player movement settings while enabled
+  if WalkspeedEnabled then
+    applyWalkspeed(WalkspeedValue)
+  end
+  if JumpPowerEnabled then
+    applyJumpPower(JumpPowerValue)
+  end
+end)
+
+Tab:AddToggle({
+  Name = "Show Aim FOV",
+  Desc = "Display FOV circle centered at cursor",
+  Default = false,
+  Flag = "AimShowFOV",
+  Callback = function(Value)
+    AimbotShowFOV = Value
+    if AimbotCircle then
+      AimbotCircle.Visible = AimbotShowFOV and (AimbotEnabled or SilentAimEnabled)
+    end
+    Notify("Aim FOV", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+Tab:AddSlider({
+  Name = "FOV Size",
+  Desc = "Radius of the aim FOV circle (pixels)",
+  Min = 20,
+  Max = 800,
+  Default = AimbotFOV,
+  Precise = false,
+  Flag = "AimFOVSize",
+  Callback = function(Value)
+    AimbotFOV = Value
+    if AimbotCircle then
+      AimbotCircle.Radius = Value
+    end
+  end
+})
+
+Tab:AddSlider({
+  Name = "FOV Thickness",
+  Desc = "Line thickness of the FOV circle",
+  Min = 1,
+  Max = 10,
+  Default = AimbotThickness,
+  Precise = true,
+  Flag = "AimFOVThickness",
+  Callback = function(Value)
+    AimbotThickness = Value
+    if AimbotCircle then
+      AimbotCircle.Thickness = Value
+    end
+  end
+})
+
+Tab:AddColorPicker({
+  Name = "FOV Color",
+  Desc = "Color of the FOV circle",
+  Default = AimbotCircleColor,
+  Flag = "AimFOVColor",
+  Callback = function(Value)
+    AimbotCircleColor = Value
+    if AimbotCircle then
+      AimbotCircle.Color = Value
+    end
+  end
+})
+
+local visualsTab = Window:MakeTab({
+  IsMobile = false,
+  IsPC = false,
+  Name = "Visuals",
+  Icon = "rbxassetid://4483345998"
+})
+
+visualsTab:AddSection("ESP")
+visualsTab:AddToggle({
+  Name = "ESP",
+  Desc = "Draw boxes around players",
+  Default = false,
+  Flag = "ESPToggle",
+  Callback = function(Value)
+    ESPEnabled = Value
+    if not ESPEnabled then
+      for _, player in ipairs(Players:GetPlayers()) do
+        removeESPObjects(player)
+      end
+    end
+    Notify("ESP", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+visualsTab:AddToggle({
+  Name = "Show Names",
+  Desc = "Show player name and distance on ESP",
+  Default = false,
+  Flag = "ESPShowNames",
+  Callback = function(Value)
+    ESPShowNames = Value
+    Notify("ESP Names", (Value and "Shown" or "Hidden"), 2)
+  end
+})
+
+visualsTab:AddToggle({
+  Name = "Teammate Check",
+  Desc = "Hide ESP for teammates when enabled",
+  Default = false,
+  Flag = "ESPTeammateCheck",
+  Callback = function(Value)
+    ESPTeammateCheck = Value
+    Notify("ESP Teammate Check", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+visualsTab:AddColorPicker({
+  Name = "ESP Box Color",
+  Desc = "Color for ESP boxes and text",
+  Default = ESPBoxColor,
+  Flag = "ESPBoxColor",
+  Callback = function(Value)
+    ESPBoxColor = Value
+  end
+})
+
+visualsTab:AddSection("Skeleton ESP")
+visualsTab:AddToggle({
+  Name = "Skeleton ESP",
+  Desc = "Draw skeleton lines on enemy players",
+  Default = false,
+  Flag = "SkeletonESPToggle",
+  Callback = function(Value)
+    SkeletonESPEnabled = Value
+    if not SkeletonESPEnabled then
+      for _, player in ipairs(Players:GetPlayers()) do
+        removeSkeletonObjects(player)
+      end
+    end
+    Notify("Skeleton ESP", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+visualsTab:AddSlider({
+  Name = "Skeleton Thickness",
+  Desc = "Sets the thickness of skeleton lines",
+  Min = 1,
+  Max = 6,
+  Default = SkeletonESPThickness,
+  Precise = true,
+  Flag = "SkeletonESPThickness",
+  Callback = function(Value)
+    SkeletonESPThickness = Value
+  end
+})
+
+visualsTab:AddColorPicker({
+  Name = "Skeleton Color",
+  Desc = "Color for skeleton ESP lines",
+  Default = SkeletonESPColor,
+  Flag = "SkeletonESPColor",
+  Callback = function(Value)
+    SkeletonESPColor = Value
+  end
+})
+
+local playerTab = Window:MakeTab({
+  IsMobile = false,
+  IsPC = false,
+  Name = "Player",
+  Icon = "rbxassetid://4483345998"
+})
+
+playerTab:AddSection("Walkspeed")
+
+playerTab:AddToggle({
+  Name = "Walkspeed",
+  Desc = "Enable custom walk speed",
+  Default = false,
+  Flag = "WalkspeedToggle",
+  Callback = function(Value)
+    WalkspeedEnabled = Value
+    updateWalkspeed()
+    Notify("Walkspeed", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+playerTab:AddSlider({
+  Name = "Walkspeed Value",
+  Desc = "Set custom player walk speed",
+  Min = 16,
+  Max = 200,
+  Default = WalkspeedValue,
+  Precise = true,
+  Flag = "WalkspeedValue",
+  Callback = function(Value)
+    WalkspeedValue = Value
+    if WalkspeedEnabled then
+      updateWalkspeed()
+    end
+  end
+})
+
+playerTab:AddSection("Jump Power")
+playerTab:AddToggle({
+  Name = "Jump Power",
+  Desc = "Enable custom jump power",
+  Default = false,
+  Flag = "JumpPowerToggle",
+  Callback = function(Value)
+    JumpPowerEnabled = Value
+    updateJumpPower()
+    Notify("Jump Power", (Value and "Enabled" or "Disabled"), 2)
+  end
+})
+
+playerTab:AddSlider({
+  Name = "Jump Power Value",
+  Desc = "Set custom jump power",
+  Min = 50,
+  Max = 250,
+  Default = JumpPowerValue,
+  Precise = true,
+  Flag = "JumpPowerValue",
+  Callback = function(Value)
+    JumpPowerValue = Value
+    if JumpPowerEnabled then
+      updateJumpPower()
+    end
+  end
+})
+
+Tab:AddSection("JumpPower")
+
+-- If splib failed to load (fallback), provide simple keybind toggles so features remain testable.
+if usedFallback then
+  print("splib failed to load — using keybind fallbacks: RightShift=Walkspeed, RightControl=JumpPower")
+  UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+      if input.KeyCode == Enum.KeyCode.RightShift then
+        WalkspeedEnabled = not WalkspeedEnabled
+        updateWalkspeed()
+        print("Walkspeed toggled (fallback):", WalkspeedEnabled)
+      elseif input.KeyCode == Enum.KeyCode.RightControl then
+        JumpPowerEnabled = not JumpPowerEnabled
+        updateJumpPower()
+        print("JumpPower toggled (fallback):", JumpPowerEnabled)
+      end
+    end
+  end)
+end
+
+local function sanitizeNumberText(text)
+  return tostring(text or ""):gsub("%D", "")
+end
+
+local function findPlayerMoneyStat()
+  local moneyNames = {"Money", "Cash", "Coins", "Currency", "Balance", "Wallet"}
+  local function matchesName(obj)
+    for _, name in ipairs(moneyNames) do
+      if obj.Name == name then
+        return true
+      end
+    end
+    return false
+  end
+
+  local function search(root)
+    if not root or not root.GetDescendants then
+      return nil
+    end
+    for _, obj in ipairs(root:GetDescendants()) do
+      if (obj:IsA("IntValue") or obj:IsA("NumberValue")) and matchesName(obj) then
+        return obj
+      end
+    end
+    return nil
+  end
+
+  if LocalPlayer then
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+      local stat = search(leaderstats)
+      if stat then
+        return stat
+      end
+    end
+    return search(LocalPlayer)
+  end
+  return nil
+end
+
+local function setPlayerMoney(amount)
+  amount = tonumber(amount)
+  if not amount then
+    return false
+  end
+  local stat = findPlayerMoneyStat()
+  if not stat then
+    return false
+  end
+  if stat:IsA("IntValue") then
+    stat.Value = math.floor(amount)
+  else
+    stat.Value = amount
+  end
+  return true
+end
+
+local testTab = Window:MakeTab({
+    IsMobile = false,
+    IsPC = false,
+    Name = "Test",
+    Icon = "rbxassetid://4483345998"
+})
+
+testTab:AddSection("Test Section")
+
+local moneyTextBox = testTab:AddTextbox({
+  Name = "Money Amount",
+  Desc = "Type a number and press Enter to change your money.",
+  PlaceholderText = "Numbers only",
+  Default = "",
+  Flag = "TestMoneyAmount",
+  Callback = function(Value)
+    local amount = sanitizeNumberText(Value)
+    if amount == "" then
+      return
+    end
+    setPlayerMoney(amount)
+  end
+})
+
+if moneyTextBox then
+  moneyTextBox.OnChanging = function(text)
+    return sanitizeNumberText(text)
+  end
+end
+

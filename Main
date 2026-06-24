@@ -22,11 +22,14 @@ do
           AddDropdown = function(...) end,
           AddSlider = function(...) end,
           AddColorPicker = function(...) end,
+          AddTextbox = function(...) end,
           AddParagraph = function(...) end,
           ClearSettings = function(...) end,
           SetFlag = function(...) end,
           MakeNotification = function(...) end
-        } end
+        } end,
+        AddPlayerTab = function(self, ...) return self:MakeTab(...) end,
+        AddTab = function(self, ...) return self:MakeTab(...) end
       } end
     }
   end
@@ -62,7 +65,7 @@ do
     if type(splib.MakeWindow) == "function" then
       pcall(function() Window = splib.MakeWindow() end)
     end
-    Window = Window or { MakeTab = function(...) return { AddSection = function(...) end, AddToggle = function(...) end, AddDropdown = function(...) end, AddSlider = function(...) end, AddColorPicker = function(...) end, AddTextbox = function(...) end, AddParagraph = function(...) end, ClearSettings = function(...) end, SetFlag = function(...) end, MakeNotification = function(...) end } end }
+    Window = Window or { MakeTab = function(...) return { AddSection = function(...) end, AddToggle = function(...) end, AddDropdown = function(...) end, AddSlider = function(...) end, AddColorPicker = function(...) end, AddTextbox = function(...) end, AddParagraph = function(...) end, ClearSettings = function(...) end, SetFlag = function(...) end, MakeNotification = function(...) end } end, AddPlayerTab = function(self, ...) return self:MakeTab(...) end, AddTab = function(self, ...) return self:MakeTab(...) end }
   end
 end
 
@@ -1252,16 +1255,76 @@ local function setPlayerMoney(amount)
   return true
 end
 
-local testTab = Window:MakeTab({
+local function createTab(config)
+  if not Window then
+    return nil
+  end
+  local tabCreators = {"MakeTab", "AddPlayerTab", "AddTab"}
+  for _, method in ipairs(tabCreators) do
+    if type(Window[method]) == "function" then
+      local ok, result = pcall(function()
+        return Window[method](Window, config)
+      end)
+      if ok and result then
+        if type(result.AddSection) ~= "function" then
+          result.AddSection = function(...) end
+        end
+        if type(result.AddToggle) ~= "function" then
+          result.AddToggle = function(...) end
+        end
+        if type(result.AddDropdown) ~= "function" then
+          result.AddDropdown = function(...) end
+        end
+        if type(result.AddSlider) ~= "function" then
+          result.AddSlider = function(...) end
+        end
+        if type(result.AddColorPicker) ~= "function" then
+          result.AddColorPicker = function(...) end
+        end
+        if type(result.AddTextbox) ~= "function" then
+          result.AddTextbox = function(...) end
+        end
+        if type(result.AddTextBox) ~= "function" then
+          result.AddTextBox = function(...) end
+        end
+        if type(result.AddInput) ~= "function" then
+          result.AddInput = function(...) end
+        end
+        return result
+      end
+    end
+  end
+  return nil
+end
+
+local function addTextbox(tab, params)
+  if not tab then
+    return nil
+  end
+  if type(tab.AddTextbox) == "function" then
+    return tab:AddTextbox(params)
+  end
+  if type(tab.AddTextBox) == "function" then
+    return tab:AddTextBox(params)
+  end
+  if type(tab.AddInput) == "function" then
+    return tab:AddInput(params)
+  end
+  return nil
+end
+
+local testTab = createTab({
     IsMobile = false,
     IsPC = false,
     Name = "Test",
     Icon = "rbxassetid://4483345998"
 })
 
-testTab:AddSection("Test Section")
+if testTab then
+  testTab:AddSection("Test Section")
+end
 
-local moneyTextBox = testTab:AddTextbox({
+local moneyTextBox = addTextbox(testTab,{ 
   Name = "Money Amount",
   Desc = "Type a number and press Enter to change your money.",
   PlaceholderText = "Numbers only",
